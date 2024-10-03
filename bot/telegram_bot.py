@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import aiohttp
 import io
+import re
 
 from datetime import date
 from uuid import uuid4
@@ -45,6 +47,7 @@ class ChatGPTTelegramBot:
             BotCommand(command='stats', description=localized_text('stats_description', bot_language)),
             BotCommand(command='resend', description=localized_text('resend_description', bot_language)),
             BotCommand(command='today', description=localized_text('today_description', bot_language)),
+            BotCommand(command='price', description=localized_text('price_description', bot_language)),
         ]
         # If imaging is enabled, add the "image" command to the list
         if self.config.get('enable_image_generation', False):
@@ -87,6 +90,42 @@ class ChatGPTTelegramBot:
         
         today_date = ("Today's date is " + date.today().strftime("%B %d, %Y"))
         await update.message.reply_text(today_date, disable_web_page_preview=True)
+        
+    async def price(self, update: Update, context: ContextTypes.DEFAULT_TYPE, symbols: list = None) -> None:
+        """
+        Get stock or cryptocurrency prices.
+        """
+        # If symbols are provided, use them; otherwise, extract from the message
+        if symbols:
+            symbols = [symbol.strip().upper() for symbol in symbols]
+        else:
+            # Extract symbols from the message
+            message_text = message_text(update.message)
+            if len(message_text) < 2:
+                await update.message.reply_text("Please specify at least one cryptocurrency symbol.")
+                return
+
+            symbols = [symbol.strip().upper() for symbol in message_text[1].split(',')]
+        
+        url = f"{os.environ['COINMARKETCAP_API_URL']}/cryptocurrency/quotes/latest"
+        headers = {
+            'X-CMC_PRO_API_KEY': os.environ['COINMARKETCAP_API_KEY'],
+        }
+        parameters = {'symbol': ','.join(symbols)}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, params=parameters) as response:
+                prices = await response.json()
+
+        price_text = []
+        for symbol in symbols:
+            try:
+                price = prices['data'][symbol]['quote']['USD']['price']
+                price_text.append(f"The price of {symbol} is ${price:.2f}.")
+            except KeyError:
+                price_text.append(f"Could not find price for {symbol}.")
+
+        await update.message.reply_text("\n".join(price_text), disable_web_page_preview=True)
 
     async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
@@ -1074,6 +1113,7 @@ class ChatGPTTelegramBot:
         application.add_handler(CommandHandler('stats', self.stats))
         application.add_handler(CommandHandler('resend', self.resend))
         application.add_handler(CommandHandler('today', self.today))
+        application.add_handler(CommandHandler('price', self.price))
         application.add_handler(CommandHandler(
             'chat', self.prompt, filters=filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
         )
