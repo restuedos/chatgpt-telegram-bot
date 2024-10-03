@@ -48,6 +48,7 @@ class ChatGPTTelegramBot:
             BotCommand(command='resend', description=localized_text('resend_description', bot_language)),
             BotCommand(command='today', description=localized_text('today_description', bot_language)),
             BotCommand(command='price', description=localized_text('price_description', bot_language)),
+            BotCommand(command='top_stocks', description=localized_text('top_stocks_description', bot_language)),
         ]
         # If imaging is enabled, add the "image" command to the list
         if self.config.get('enable_image_generation', False):
@@ -126,6 +127,44 @@ class ChatGPTTelegramBot:
                 price_text.append(f"Could not find price for {symbol}.")
 
         await update.message.reply_text("\n".join(price_text), disable_web_page_preview=True)
+        
+    async def top_stocks(self, update: Update, context: ContextTypes.DEFAULT_TYPE, top_n: int = 10) -> None:
+        """
+        Get the top N stocks or cryptocurrencies based on market cap.
+        If no value for top_n is provided, defaults to 10.
+        """
+        # Ensure top_n is positive
+        if top_n <= 0:
+            await update.message.reply_text("Please specify a positive number for top stocks.")
+            return
+
+        url = f"{os.environ['COINMARKETCAP_API_URL']}/cryptocurrency/listings/latest"
+        headers = {
+            'X-CMC_PRO_API_KEY': os.environ['COINMARKETCAP_API_KEY'],
+        }
+        parameters = {'limit': top_n, 'convert': 'USD'}
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, params=parameters) as response:
+                    response.raise_for_status()  # Raise an error for bad responses
+                    data = await response.json()
+        except aiohttp.ClientError as e:
+            await update.message.reply_text(f"An error occurred while fetching top stocks: {e}")
+            return
+
+        top_stocks_text = []
+        for item in data.get('data', []):
+            name = item['name']
+            symbol = item['symbol']
+            price = item['quote']['USD']['price']
+            market_cap = item['quote']['USD']['market_cap']
+            top_stocks_text.append(f"{name} ({symbol}): ${price:.2f} | Market Cap: ${market_cap:,.2f}")
+
+        if top_stocks_text:
+            await update.message.reply_text("\n".join(top_stocks_text), disable_web_page_preview=True)
+        else:
+            await update.message.reply_text("Could not retrieve top stocks.")
 
     async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
@@ -1114,6 +1153,7 @@ class ChatGPTTelegramBot:
         application.add_handler(CommandHandler('resend', self.resend))
         application.add_handler(CommandHandler('today', self.today))
         application.add_handler(CommandHandler('price', self.price))
+        application.add_handler(CommandHandler('top_stocks', self.top_stocks))
         application.add_handler(CommandHandler(
             'chat', self.prompt, filters=filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
         )
