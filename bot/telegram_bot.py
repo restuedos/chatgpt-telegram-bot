@@ -5,6 +5,7 @@ import logging
 import os
 import aiohttp
 import io
+import json
 import re
 
 from datetime import date
@@ -766,135 +767,206 @@ class ChatGPTTelegramBot:
                     logging.warning('Message does not start with trigger keyword, ignoring...')
                     return
 
-        try:
-            total_tokens = 0
+        # Use OpenAI to interpret the user's input
+        intent_response = await self.openai.get_chat_response(chat_id, prompt)
 
-            if self.config['stream']:
-                await update.effective_message.reply_chat_action(
-                    action=constants.ChatAction.TYPING,
-                    message_thread_id=get_thread_id(update)
-                )
+        # Process the intent response
+        intent, params = await self.extract_intent_and_params(chat_id, intent_response)
 
-                stream_response = self.openai.get_chat_response_stream(chat_id=chat_id, query=prompt)
-                i = 0
-                prev = ''
-                sent_message = None
-                backoff = 0
-                stream_chunk = 0
+        if intent == "today":
+            await self.today(update, context)
 
-                async for content, tokens in stream_response:
-                    if is_direct_result(content):
-                        return await handle_direct_result(self.config, update, content)
+        elif intent == "price":
+            symbols = params.get('symbols', [])
+            if symbols:
+                await self.price(update, context, symbols)
+            else:
+                await update.message.reply_text("Please specify the stock/cryptocurrency symbols you want to know")
 
-                    if len(content.strip()) == 0:
-                        continue
+        elif intent == "top_stocks":
+            top_n = params.get('top_n', 5)
+            
+            try:
+                top_n = int(top_n)
+            except (ValueError, TypeError):
+                top_n = 5  # Fallback to default value
+                
+            await self.top_stocks(update, context, top_n)
 
-                    stream_chunks = split_into_chunks(content)
-                    if len(stream_chunks) > 1:
-                        content = stream_chunks[-1]
-                        if stream_chunk != len(stream_chunks) - 1:
-                            stream_chunk += 1
+        else:
+            try:
+                total_tokens = 0
+
+                if self.config['stream']:
+                    await update.effective_message.reply_chat_action(
+                        action=constants.ChatAction.TYPING,
+                        message_thread_id=get_thread_id(update)
+                    )
+
+                    stream_response = self.openai.get_chat_response_stream(chat_id=chat_id, query=prompt)
+                    i = 0
+                    prev = ''
+                    sent_message = None
+                    backoff = 0
+                    stream_chunk = 0
+
+                    async for content, tokens in stream_response:
+                        if is_direct_result(content):
+                            return await handle_direct_result(self.config, update, content)
+
+                        if len(content.strip()) == 0:
+                            continue
+
+                        stream_chunks = split_into_chunks(content)
+                        if len(stream_chunks) > 1:
+                            content = stream_chunks[-1]
+                            if stream_chunk != len(stream_chunks) - 1:
+                                stream_chunk += 1
+                                try:
+                                    await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
+                                                                stream_chunks[-2])
+                                except:
+                                    pass
+                                try:
+                                    sent_message = await update.effective_message.reply_text(
+                                        message_thread_id=get_thread_id(update),
+                                        text=content if len(content) > 0 else "..."
+                                    )
+                                except:
+                                    pass
+                                continue
+
+                        cutoff = get_stream_cutoff_values(update, content)
+                        cutoff += backoff
+
+                        if i == 0:
                             try:
-                                await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
-                                                              stream_chunks[-2])
-                            except:
-                                pass
-                            try:
+                                if sent_message is not None:
+                                    await context.bot.delete_message(chat_id=sent_message.chat_id,
+                                                                    message_id=sent_message.message_id)
                                 sent_message = await update.effective_message.reply_text(
                                     message_thread_id=get_thread_id(update),
-                                    text=content if len(content) > 0 else "..."
+                                    reply_to_message_id=get_reply_to_message_id(self.config, update),
+                                    text=content,
                                 )
                             except:
-                                pass
-                            continue
+                                continue
 
-                    cutoff = get_stream_cutoff_values(update, content)
-                    cutoff += backoff
+                        elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
+                            prev = content
 
-                    if i == 0:
-                        try:
-                            if sent_message is not None:
-                                await context.bot.delete_message(chat_id=sent_message.chat_id,
-                                                                 message_id=sent_message.message_id)
-                            sent_message = await update.effective_message.reply_text(
-                                message_thread_id=get_thread_id(update),
-                                reply_to_message_id=get_reply_to_message_id(self.config, update),
-                                text=content,
-                            )
-                        except:
-                            continue
+                            try:
+                                use_markdown = tokens != 'not_finished'
+                                await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
+                                                            text=content, markdown=use_markdown)
 
-                    elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
-                        prev = content
+                            except RetryAfter as e:
+                                backoff += 5
+                                await asyncio.sleep(e.retry_after)
+                                continue
 
-                        try:
-                            use_markdown = tokens != 'not_finished'
-                            await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
-                                                          text=content, markdown=use_markdown)
+                            except TimedOut:
+                                backoff += 5
+                                await asyncio.sleep(0.5)
+                                continue
 
-                        except RetryAfter as e:
-                            backoff += 5
-                            await asyncio.sleep(e.retry_after)
-                            continue
+                            except Exception:
+                                backoff += 5
+                                continue
 
-                        except TimedOut:
-                            backoff += 5
-                            await asyncio.sleep(0.5)
-                            continue
+                            await asyncio.sleep(0.01)
 
-                        except Exception:
-                            backoff += 5
-                            continue
+                        i += 1
+                        if tokens != 'not_finished':
+                            total_tokens = int(tokens)
 
-                        await asyncio.sleep(0.01)
+                else:
+                    async def _reply():
+                        nonlocal total_tokens
+                        response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=prompt)
 
-                    i += 1
-                    if tokens != 'not_finished':
-                        total_tokens = int(tokens)
+                        if is_direct_result(response):
+                            return await handle_direct_result(self.config, update, response)
 
-            else:
-                async def _reply():
-                    nonlocal total_tokens
-                    response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=prompt)
+                        # Split into chunks of 4096 characters (Telegram's message limit)
+                        chunks = split_into_chunks(response)
 
-                    if is_direct_result(response):
-                        return await handle_direct_result(self.config, update, response)
-
-                    # Split into chunks of 4096 characters (Telegram's message limit)
-                    chunks = split_into_chunks(response)
-
-                    for index, chunk in enumerate(chunks):
-                        try:
-                            await update.effective_message.reply_text(
-                                message_thread_id=get_thread_id(update),
-                                reply_to_message_id=get_reply_to_message_id(self.config,
-                                                                            update) if index == 0 else None,
-                                text=chunk,
-                                parse_mode=constants.ParseMode.MARKDOWN
-                            )
-                        except Exception:
+                        for index, chunk in enumerate(chunks):
                             try:
                                 await update.effective_message.reply_text(
                                     message_thread_id=get_thread_id(update),
                                     reply_to_message_id=get_reply_to_message_id(self.config,
                                                                                 update) if index == 0 else None,
-                                    text=chunk
+                                    text=chunk,
+                                    parse_mode=constants.ParseMode.MARKDOWN
                                 )
-                            except Exception as exception:
-                                raise exception
+                            except Exception:
+                                try:
+                                    await update.effective_message.reply_text(
+                                        message_thread_id=get_thread_id(update),
+                                        reply_to_message_id=get_reply_to_message_id(self.config,
+                                                                                    update) if index == 0 else None,
+                                        text=chunk
+                                    )
+                                except Exception as exception:
+                                    raise exception
 
-                await wrap_with_indicator(update, context, _reply, constants.ChatAction.TYPING)
+                    await wrap_with_indicator(update, context, _reply, constants.ChatAction.TYPING)
 
-            add_chat_request_to_usage_tracker(self.usage, self.config, user_id, total_tokens)
+                add_chat_request_to_usage_tracker(self.usage, self.config, user_id, total_tokens)
 
+            except Exception as e:
+                logging.exception(e)
+                await update.effective_message.reply_text(
+                    message_thread_id=get_thread_id(update),
+                    reply_to_message_id=get_reply_to_message_id(self.config, update),
+                    text=f"{localized_text('chat_fail', self.config['bot_language'])} {str(e)}",
+                    parse_mode=constants.ParseMode.MARKDOWN
+                )
+
+    async def extract_intent_and_params(self, chat_id: str, prompt: str):
+        """
+        Use OpenAI to extract the intent and parameters from the user prompt.
+        """
+        # Prepare the prompt for OpenAI
+        openai_prompt = (
+            "Extract the intent and parameters from the following user prompt:\n"
+            f"'{prompt}'\n"
+            "If the user wants today date, intent is 'today' without any parameter.\n"
+            "If the user wants the price of stock, intent is 'price' and parameter key is 'symbols' as list.\n"
+            "If the user wants list of top n stocks, intent is 'top_stocks' and parameter key is 'top_n' as int.\n"
+            "Please provide the response strictly in this format:\n"
+            "{'intent': 'your_intent', 'parameters': {'key': 'value'}}"
+        )
+
+        # Call OpenAI API
+        response = await self.openai.get_chat_response(chat_id, query=openai_prompt)
+
+        # Check if the response is a tuple and extract the relevant part
+        response_text = response[0] if isinstance(response, tuple) else response
+
+        # Decode the response if it's in bytes
+        if isinstance(response_text, bytes):
+            response_text = response_text.decode('utf-8')
+
+        # Log the raw response for debugging
+        logging.info(f"Chat ID: {chat_id}, Raw OpenAI response: {response_text}")
+
+        try:
+            # Clean the response text by replacing single quotes with double quotes
+            response_text = re.sub(r"(?<!\\)'", '"', response_text.strip())
+
+            # Convert the string representation of the dictionary to an actual dictionary
+            parsed_response = json.loads(response_text)
+            intent = parsed_response.get('intent', 'unknown')
+            parameters = parsed_response.get('parameters', {})
+            return intent, parameters
+        except json.JSONDecodeError as e:
+            logging.error(f"Error parsing OpenAI response: {e} (Response: {response_text})")
+            return 'error', {}
         except Exception as e:
-            logging.exception(e)
-            await update.effective_message.reply_text(
-                message_thread_id=get_thread_id(update),
-                reply_to_message_id=get_reply_to_message_id(self.config, update),
-                text=f"{localized_text('chat_fail', self.config['bot_language'])} {str(e)}",
-                parse_mode=constants.ParseMode.MARKDOWN
-            )
+            logging.error(f"Unexpected error: {e} (Response: {response_text})")
+            return 'error', {}
 
     async def inline_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
